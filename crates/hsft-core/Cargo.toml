@@ -8,6 +8,8 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+data-encoding = "2"
+fs4 = "0.13"
 hex.workspace = true
 iroh.workspace = true
 rand.workspace = true

@@ -351,7 +351,9 @@ fn check_journal(
     manifest: &Manifest,
 ) -> Vec<(u32, Hash)> {
     let records: Vec<(u32, Hash)> = journal
-        .chunks_exact(JOURNAL_RECORD)
+        .as_chunks::<JOURNAL_RECORD>()
+        .0
+        .iter()
         .map(|r| {
             let unit = u32::from_le_bytes(r[..4].try_into().unwrap());
             (unit, r[4..].try_into().unwrap())
