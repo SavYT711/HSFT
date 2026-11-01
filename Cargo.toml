@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/hsft-core", "crates/hsft-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/SavYT711/HSFT"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+hex = "0.4"
+iroh = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

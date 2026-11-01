@@ -1,0 +1,15 @@
+[package]
+name = "hsft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hsft"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+hsft-core = { path = "../hsft-core" }
+tokio.workspace = true

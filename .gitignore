@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+**/target/
+
+# Machine-specific build settings (keeps build output out of OneDrive)
+/.cargo/config.toml
+
+# Tauri generated files
+/crates/hsft-app/gen/
+
+# Local test data
+*.part
+*.hsft-progress
+.env
