@@ -42,6 +42,8 @@ const SEND_WINDOW: u64 = 64 * 1024 * 1024;
 pub enum Network {
     /// Relays and address lookup, for reaching friends over the internet.
     Internet,
+    /// Never connects directly, for testing what strict home routers lead to.
+    RelayOnly,
     /// Direct addresses only, for tests and benchmarks on one machine.
     LocalOnly,
 }
@@ -154,10 +156,14 @@ impl Node {
         let transport = QuicTransportConfig::builder()
             .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
             .send_window(SEND_WINDOW)
+            // Finish units one after another rather than all at once at the very end, so that a
+            // transfer stopped on a slow link leaves as many finished units as possible.
+            .send_fairness(false)
             .keep_alive_interval(Duration::from_secs(5))
             .build();
         let builder = match network {
             Network::Internet => Endpoint::builder(presets::N0),
+            Network::RelayOnly => Endpoint::builder(presets::N0).clear_ip_transports(),
             Network::LocalOnly => {
                 Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
             }
@@ -316,7 +322,7 @@ fn decode_invite(code: &str) -> Result<Invite> {
 impl Inner {
     /// Gives the relay connection a moment, so that invites contain a reachable address.
     async fn wait_online(&self) {
-        if self.network == Network::Internet {
+        if self.network != Network::LocalOnly {
             let _ = tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online()).await;
         }
     }
@@ -338,7 +344,7 @@ impl Inner {
                 tracing::warn!(transfer, "transfer failed: {error:#}");
                 let lost = conn.is_some_and(|c| c.close_reason().is_some());
                 let error = if lost {
-                    "The connection ended early. Send it again to continue where it stopped."
+                    "The transfer stopped before finishing. Sending it again continues from there."
                         .to_string()
                 } else {
                     format!("{error:#}")
@@ -424,6 +430,7 @@ async fn run_send(
             conn.close(CLOSE_DONE.into(), b"done");
             Ok(None)
         }
+        SendResult::Declined(reason) if reason.is_empty() => bail!("{} declined.", friend.name),
         SendResult::Declined(reason) => bail!("{} declined: {reason}", friend.name),
     }
 }
@@ -461,7 +468,7 @@ async fn run_receive(
         }
     };
     let Some(dest) = answer else {
-        incoming.decline("they said no").await?;
+        incoming.decline("").await?;
         // Give the reply time to arrive before the connection is dropped.
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
         return Ok(None);

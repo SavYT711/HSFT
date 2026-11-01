@@ -237,8 +237,9 @@ async fn a_cancelled_transfer_resumes_without_resending_everything() {
     let id = alice.node.id();
     let first = bob.node.send(&id, vec![file.clone()]).unwrap();
     accept_offer(&mut alice, dest.path()).await;
+    // Progress includes units still in flight, so wait for well past what must be stored.
     next_matching(&mut alice, |e| {
-        matches!(e, Event::Progress { done, .. } if *done > 40 * 1024 * 1024)
+        matches!(e, Event::Progress { done, .. } if *done > 120 * 1024 * 1024)
     })
     .await;
     bob.node.cancel(first);

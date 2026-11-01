@@ -21,6 +21,8 @@ use crate::wire::{from_runs, read_msg, to_runs, write_msg, Control, FrameHeader,
 
 const STREAMS: usize = 16;
 const MAX_DAMAGED_UNITS: u32 = 32;
+/// Progress is counted in steps much smaller than a unit, so a slow link never looks frozen.
+const PROGRESS_STEP: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 pub struct Progress {
@@ -151,8 +153,15 @@ async fn send_stream(
             None => stream.insert(conn.open_uni().await?),
         };
         out.write_all(&header.to_bytes()).await?;
-        out.write_all(&body).await?;
-        progress.done.fetch_add(raw_len as u64, Ordering::Relaxed);
+        let mut counted = 0;
+        let mut written = 0;
+        for slice in body.chunks(PROGRESS_STEP) {
+            out.write_all(slice).await?;
+            written += slice.len() as u64;
+            let raw_so_far = raw_len as u64 * written / body.len() as u64;
+            progress.done.fetch_add(raw_so_far - counted, Ordering::Relaxed);
+            counted = raw_so_far;
+        }
     }
     if let Some(mut out) = stream {
         out.finish()?;
@@ -311,7 +320,15 @@ async fn receive_stream(
             bail!("peer sent a unit with the wrong size");
         }
         let mut body = vec![0u8; header.wire_len as usize];
-        AsyncReadExt::read_exact(&mut stream, &mut body).await?;
+        let mut counted = 0;
+        let mut received = 0;
+        for slice in body.chunks_mut(PROGRESS_STEP) {
+            AsyncReadExt::read_exact(&mut stream, slice).await?;
+            received += slice.len() as u64;
+            let raw_so_far = header.raw_len as u64 * received / header.wire_len as u64;
+            progress.done.fetch_add(raw_so_far - counted, Ordering::Relaxed);
+            counted = raw_so_far;
+        }
 
         let store = partial.clone();
         let done = spawn_blocking(move || -> Result<Option<bool>> {
@@ -329,14 +346,11 @@ async fn receive_stream(
         match done {
             None => {
                 tracing::warn!(unit = header.unit, "unit arrived damaged");
+                progress.done.fetch_sub(header.raw_len as u64, Ordering::Relaxed);
                 resend.send(header.unit)?;
             }
-            Some(finished) => {
-                progress.done.fetch_add(header.raw_len as u64, Ordering::Relaxed);
-                if finished {
-                    complete.notify_one();
-                }
-            }
+            Some(true) => complete.notify_one(),
+            Some(false) => {}
         }
     }
 }

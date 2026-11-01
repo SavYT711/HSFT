@@ -8,13 +8,13 @@ use hsft_core::{Event, FriendInfo, Network, Node};
 
 const USAGE: &str = "\
 Usage:
-  hsft id                     show your id
-  hsft invite                 create an invite code and wait for a friend to use it
-  hsft join <code>            become friends using a friend's invite code
-  hsft friends                list friends
-  hsft send <friend> <path>...  send files or folders to a friend
-  hsft receive <folder>       accept everything friends send, into a folder
-  hsft bench <path>           measure speed by sending to a second peer on this PC
+  hsft-cli id                     show your id
+  hsft-cli invite                 create an invite code and wait for a friend to use it
+  hsft-cli join <code>            become friends using a friend's invite code
+  hsft-cli friends                list friends
+  hsft-cli send <friend> <path>...  send files or folders to a friend
+  hsft-cli receive <folder>       accept everything friends send, into a folder
+  hsft-cli bench <path>           measure speed by sending to a second peer on this PC
 ";
 
 #[tokio::main]
@@ -28,19 +28,25 @@ async fn main() -> Result<()> {
     match args.as_slice() {
         ["bench", path] => bench(Path::new(path)).await,
         ["id"] => {
-            println!("{}", start().await?.0.id());
+            let (node, _) = start().await?;
+            println!("{}", node.id());
+            node.shutdown().await;
             Ok(())
         }
         ["friends"] => {
-            for friend in start().await?.0.friends() {
+            let (node, _) = start().await?;
+            for friend in node.friends() {
                 println!("{}  {}", friend.name, friend.id);
             }
+            node.shutdown().await;
             Ok(())
         }
         ["invite"] => invite().await,
         ["join", code] => {
-            let friend = start().await?.0.join(code).await?;
-            println!("You and {} are now friends.", friend.name);
+            let (node, _) = start().await?;
+            let joined = node.join(code).await;
+            node.shutdown().await;
+            println!("You and {} are now friends.", joined?.name);
             Ok(())
         }
         ["receive", dest] => receive(PathBuf::from(dest)).await,
@@ -62,7 +68,11 @@ fn data_dir() -> Result<PathBuf> {
 }
 
 async fn start() -> Result<(Node, tokio::sync::mpsc::UnboundedReceiver<Event>)> {
-    Node::start(&data_dir()?, Network::Internet).await
+    let network = match std::env::var_os("HSFT_RELAY_ONLY") {
+        Some(_) => Network::RelayOnly,
+        None => Network::Internet,
+    };
+    Node::start(&data_dir()?, network).await
 }
 
 async fn invite() -> Result<()> {

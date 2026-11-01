@@ -30,7 +30,7 @@ If a transfer stops, send the same thing again and it continues where it left of
 - **Direct connections:** peers connect over QUIC using [iroh](https://github.com/n0-computer/iroh),
   which finds the fastest route and punches through home routers.
 - **Fallback relay:** when no direct route exists, encrypted data passes through a relay.
-  This is slower, and the app shows when it happens.
+  This is much slower, and the app shows when it happens.
 - **Fast by design:** data flows over 16 parallel streams, is compressed only when that helps, and
   small files are packed together.
 - **Verified:** every 4 MiB unit is hashed with BLAKE3 and checked on arrival. Damaged units are
@@ -55,10 +55,15 @@ do. Over the internet, the slower connection's upload or download speed sets the
 
 | Test | Result |
 |---|---|
-| 3 GB of incompressible data | 134 to 278 MB/s across runs |
-| 20,000 files of 8 KB | 7.9 s, about 2,500 files per second |
+| 3 GB of incompressible data | 106 to 278 MB/s across runs |
+| 20,000 files of 8 KB | 8 to 12 s, about 2,000 files per second |
+| Through the public relay | About 0.35 MB/s |
 
-Run your own measurement with `hsft bench <path>`.
+The relay figure only applies when no direct route can be found, such as when both friends are
+behind strict routers. The app shows "through a relay" when this happens. The public relay is too
+slow for large files, so a self-hosted relay is planned.
+
+Run your own measurement with `hsft-cli bench <path>`.
 
 ## Build from source
 
