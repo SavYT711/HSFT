@@ -14,3 +14,4 @@ anyhow.workspace = true
 dirs = "6"
 hsft-core = { path = "../hsft-core" }
 tokio.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

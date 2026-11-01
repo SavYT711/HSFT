@@ -19,7 +19,7 @@ use crate::disk::{root_hash, Hash, Partial, Source};
 use crate::plan::{Manifest, Scanned};
 use crate::wire::{from_runs, read_msg, to_runs, write_msg, Control, FrameHeader, HEADER_LEN};
 
-const STREAMS: usize = 8;
+const STREAMS: usize = 16;
 const MAX_DAMAGED_UNITS: u32 = 32;
 
 #[derive(Debug, Default)]
@@ -268,6 +268,7 @@ impl Incoming {
             }
         }
 
+        tracing::info!("all units stored");
         let root = partial.root()?;
         write_msg(&mut self.control_out, &Control::Done { root: hex::encode(root) }).await?;
         match read_msg(&mut self.control_in).await? {
@@ -279,6 +280,7 @@ impl Incoming {
             other => bail!("unexpected message: {other:?}"),
         }
         let saved = spawn_blocking(move || partial.finalize()).await??;
+        tracing::info!("files saved");
         write_msg(&mut self.control_out, &Control::Saved).await?;
         // Keep the connection up until the sender has read the last message.
         let _ = self.control_out.finish();

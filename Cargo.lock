@@ -903,6 +903,7 @@ dependencies = [
  "dirs",
  "hsft-core",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

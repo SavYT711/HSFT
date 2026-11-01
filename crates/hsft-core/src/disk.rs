@@ -3,23 +3,30 @@
 //! Incoming data goes to numbered `.part` files in a hidden-away folder, with a journal of finished
 //! units beside them. Nothing appears under its real name until the whole transfer is verified, and
 //! an interrupted transfer picks up from the journal.
+//!
+//! Small files share one batch file until then. Creating a file is by far the slowest step on
+//! Windows, so a small file should be created once, at the end, with its data and date in place.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
-use crate::plan::{plan_units, Manifest, Unit};
+use crate::plan::{is_batched, plan_units, FileEntry, Manifest, Unit, UNIT_SIZE};
 
 pub type Hash = [u8; 32];
 
 const JOURNAL_RECORD: usize = 4 + 32;
 const MAX_OPEN_FILES: usize = 128;
 const PARTIAL_DIR: &str = ".hsft-partial";
+const BATCH_FILE: &str = "batches.dat";
+/// More than a few threads creating files in one folder slow each other down badly on NTFS.
+const SAVE_WORKERS: usize = 4;
 
 #[cfg(unix)]
 fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -73,15 +80,18 @@ struct Handles(Mutex<HashMap<u32, Arc<File>>>);
 
 impl Handles {
     fn get(&self, index: u32, open: impl FnOnce() -> Result<File>) -> Result<Arc<File>> {
-        let mut map = self.0.lock().unwrap();
-        if let Some(file) = map.get(&index) {
+        if let Some(file) = self.0.lock().unwrap().get(&index) {
             return Ok(file.clone());
         }
-        if map.len() >= MAX_OPEN_FILES {
-            map.clear();
-        }
+        // Opening and closing can be slow on Windows, so neither happens under the lock.
         let file = Arc::new(open()?);
-        map.insert(index, file.clone());
+        let stale = {
+            let mut map = self.0.lock().unwrap();
+            let stale = (map.len() >= MAX_OPEN_FILES).then(|| std::mem::take(&mut *map));
+            map.insert(index, file.clone());
+            stale
+        };
+        drop(stale);
         Ok(file)
     }
 
@@ -147,6 +157,9 @@ pub struct Partial {
     dir: PathBuf,
     manifest: Arc<Manifest>,
     units: Vec<Unit>,
+    /// Where each unit of small files sits in the batch file.
+    slots: Vec<Option<u64>>,
+    batches: File,
     handles: Handles,
     journal: Mutex<File>,
     state: Mutex<PartialState>,
@@ -164,15 +177,28 @@ impl Partial {
         let dir = dest.join(PARTIAL_DIR).join(key);
         fs::create_dir_all(&dir).with_context(|| format!("can't write to {}", dest.display()))?;
         let units = plan_units(&manifest.files);
+        let slots = batch_slots(&units, &manifest.files);
         let mut hashes = vec![None; units.len()];
+        let batches = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(BATCH_FILE))?;
 
         let journal_path = dir.join("journal");
         let mut journaled = Vec::new();
         if let Ok(mut file) = File::open(&journal_path) {
             file.read_to_end(&mut journaled)?;
         }
-        let handles = Handles::default();
-        for (unit, hash) in check_journal(&dir, &units, &journaled, &manifest) {
+        let held = Held {
+            dir: &dir,
+            units: &units,
+            slots: &slots,
+            batches: &batches,
+            files: &manifest.files,
+        };
+        for (unit, hash) in held.check_journal(&journaled) {
             hashes[unit as usize] = Some(hash);
         }
 
@@ -196,7 +222,9 @@ impl Partial {
             dir,
             manifest,
             units,
-            handles,
+            slots,
+            batches,
+            handles: Handles::default(),
             journal: Mutex::new(journal),
             state: Mutex::new(PartialState { hashes, missing }),
         })
@@ -233,8 +261,10 @@ impl Partial {
         if self.state.lock().unwrap().hashes[index as usize].is_some() {
             return Ok(self.is_complete());
         }
-        let mut at = 0;
-        for part in &unit.parts {
+        if let Some(slot) = self.slots[index as usize] {
+            write_all_at(&self.batches, data, slot * UNIT_SIZE)?;
+        } else {
+            let part = unit.parts[0];
             let size = self.manifest.files[part.file as usize].size;
             let file = self.handles.get(part.file, || {
                 let path = part_path(&self.dir, part.file);
@@ -248,9 +278,7 @@ impl Partial {
                 file.set_len(size).context("not enough disk space")?;
                 Ok(file)
             })?;
-            let end = at + part.len as usize;
-            write_all_at(&file, &data[at..end], part.offset)?;
-            at = end;
+            write_all_at(&file, data, part.offset)?;
         }
 
         let mut record = [0u8; JOURNAL_RECORD];
@@ -301,25 +329,44 @@ impl Partial {
             target
         };
 
+        let mut folders = HashSet::new();
         for dir in &self.manifest.dirs {
-            fs::create_dir_all(target(dir))?;
+            folders.insert(target(dir));
         }
+        let targets: Vec<PathBuf> = self.manifest.files.iter().map(|f| target(&f.path)).collect();
+        for path in &targets {
+            if let Some(parent) = path.parent() {
+                folders.insert(parent.to_path_buf());
+            }
+        }
+        for folder in &folders {
+            fs::create_dir_all(folder)?;
+        }
+
         for (index, entry) in self.manifest.files.iter().enumerate() {
-            let target = target(&entry.path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+            if !is_batched(entry.size) {
+                self.place_file(index, &targets[index])?;
             }
-            let part = part_path(&self.dir, index as u32);
-            if entry.size == 0 {
-                File::create_new(&part)?;
-            }
-            if entry.modified_ms != 0 {
-                let modified = UNIX_EPOCH + Duration::from_millis(entry.modified_ms);
-                OpenOptions::new().write(true).open(&part)?.set_modified(modified)?;
-            }
-            fs::rename(&part, &target)
-                .with_context(|| format!("can't save {}", target.display()))?;
         }
+        let batched: Vec<usize> = (0..self.units.len())
+            .filter(|&unit| self.slots[unit].is_some())
+            .collect();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..SAVE_WORKERS)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        while let Some(&unit) = batched.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            self.unpack_batch(unit, &targets)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            tasks
+                .into_iter()
+                .try_for_each(|task| task.join().expect("saving thread panicked"))
+        })?;
 
         let saved_to = match renamed.len() {
             1 => self.dest.join(renamed.values().next().unwrap()),
@@ -327,6 +374,35 @@ impl Partial {
         };
         self.discard();
         Ok(saved_to)
+    }
+
+    /// Saves a file that has its own part file, or none because it is empty.
+    fn place_file(&self, index: usize, target: &Path) -> Result<()> {
+        let entry = &self.manifest.files[index];
+        if entry.size == 0 {
+            let file = create_target(target)?;
+            return set_date(&file, entry);
+        }
+        let part = part_path(&self.dir, index as u32);
+        set_date(&OpenOptions::new().write(true).open(&part)?, entry)?;
+        fs::rename(&part, target).with_context(|| format!("can't save {}", target.display()))
+    }
+
+    /// Creates the small files packed in one unit.
+    fn unpack_batch(&self, unit: usize, targets: &[PathBuf]) -> Result<()> {
+        let unit_info = &self.units[unit];
+        let slot = self.slots[unit].expect("only batches are unpacked");
+        let mut data = vec![0u8; unit_info.len as usize];
+        read_exact_at(&self.batches, &mut data, slot * UNIT_SIZE)?;
+        let mut at = 0;
+        for part in &unit_info.parts {
+            let end = at + part.len as usize;
+            let mut file = create_target(&targets[part.file as usize])?;
+            file.write_all(&data[at..end])?;
+            set_date(&file, &self.manifest.files[part.file as usize])?;
+            at = end;
+        }
+        Ok(())
     }
 
     /// Removes the partial data.
@@ -343,55 +419,93 @@ fn part_path(dir: &Path, file: u32) -> PathBuf {
     dir.join(format!("{file}.part"))
 }
 
-/// Returns the journal entries whose data on disk still matches.
-fn check_journal(
-    dir: &Path,
-    units: &[Unit],
-    journal: &[u8],
-    manifest: &Manifest,
-) -> Vec<(u32, Hash)> {
-    let records: Vec<(u32, Hash)> = journal
-        .as_chunks::<JOURNAL_RECORD>()
-        .0
-        .iter()
-        .map(|r| {
-            let unit = u32::from_le_bytes(r[..4].try_into().unwrap());
-            (unit, r[4..].try_into().unwrap())
-        })
-        .filter(|(unit, _)| (*unit as usize) < units.len())
-        .collect();
-    if records.is_empty() {
-        return Vec::new();
+fn create_target(target: &Path) -> Result<File> {
+    File::create_new(target).with_context(|| format!("can't save {}", target.display()))
+}
+
+fn set_date(file: &File, entry: &FileEntry) -> Result<()> {
+    if entry.modified_ms != 0 {
+        file.set_modified(UNIX_EPOCH + Duration::from_millis(entry.modified_ms))?;
     }
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let good = Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                let handles = Handles::default();
-                loop {
-                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(&(unit, hash)) = records.get(at) else {
-                        break;
-                    };
-                    let data = read_unit_with(&units[unit as usize], |file| {
-                        handles.get(file, || {
-                            let part = File::open(part_path(dir, file))?;
-                            if part.metadata()?.len() != manifest.files[file as usize].size {
-                                bail!("wrong size");
-                            }
-                            Ok(part)
-                        })
-                    });
-                    if data.is_ok_and(|d| *blake3::hash(&d).as_bytes() == hash) {
-                        good.lock().unwrap().push((unit, hash));
-                    }
-                }
-            });
+    Ok(())
+}
+
+fn batch_slots(units: &[Unit], files: &[FileEntry]) -> Vec<Option<u64>> {
+    let mut next = 0;
+    units
+        .iter()
+        .map(|unit| {
+            is_batched(files[unit.parts[0].file as usize].size).then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
+/// The data of an earlier attempt, as found on disk.
+struct Held<'a> {
+    dir: &'a Path,
+    units: &'a [Unit],
+    slots: &'a [Option<u64>],
+    batches: &'a File,
+    files: &'a [FileEntry],
+}
+
+impl Held<'_> {
+    fn read(&self, unit: u32, handles: &Handles) -> Result<Vec<u8>> {
+        let info = &self.units[unit as usize];
+        if let Some(slot) = self.slots[unit as usize] {
+            let mut data = vec![0u8; info.len as usize];
+            read_exact_at(self.batches, &mut data, slot * UNIT_SIZE)?;
+            return Ok(data);
         }
-    });
-    good.into_inner().unwrap()
+        read_unit_with(info, |file| {
+            handles.get(file, || {
+                let part = File::open(part_path(self.dir, file))?;
+                if part.metadata()?.len() != self.files[file as usize].size {
+                    bail!("wrong size");
+                }
+                Ok(part)
+            })
+        })
+    }
+
+    /// Returns the journal entries whose data still matches.
+    fn check_journal(&self, journal: &[u8]) -> Vec<(u32, Hash)> {
+        let records: Vec<(u32, Hash)> = journal
+            .as_chunks::<JOURNAL_RECORD>()
+            .0
+            .iter()
+            .map(|r| {
+                let unit = u32::from_le_bytes(r[..4].try_into().unwrap());
+                (unit, r[4..].try_into().unwrap())
+            })
+            .filter(|(unit, _)| (*unit as usize) < self.units.len())
+            .collect();
+        if records.is_empty() {
+            return Vec::new();
+        }
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let next = AtomicUsize::new(0);
+        let good = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let handles = Handles::default();
+                    while let Some(&(unit, hash)) =
+                        records.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        let data = self.read(unit, &handles);
+                        if data.is_ok_and(|d| *blake3::hash(&d).as_bytes() == hash) {
+                            good.lock().unwrap().push((unit, hash));
+                        }
+                    }
+                });
+            }
+        });
+        good.into_inner().unwrap()
+    }
 }
 
 /// Picks a name that doesn't exist yet in `dest`, such as `movie (1).mp4`.
@@ -479,6 +593,31 @@ mod tests {
 
         let reopened = Partial::open(dest.path(), "k", m).unwrap();
         assert_eq!(reopened.have(), vec![0]);
+    }
+
+    #[test]
+    fn small_files_resume_from_the_batch_file() {
+        let dest = tempfile::tempdir().unwrap();
+        let big_small = UNIT_SIZE / 2 - 1;
+        let m = manifest(&[("a", big_small), ("b", big_small), ("c", big_small), ("d", 4)]);
+        assert_eq!(plan_units(&m.files).len(), 2);
+        {
+            let partial = Partial::open(dest.path(), "k", m.clone()).unwrap();
+            let mut first = vec![1u8; big_small as usize];
+            first.extend(vec![2u8; big_small as usize]);
+            deliver(&partial, 0, &first);
+        }
+        let partial = Partial::open(dest.path(), "k", m).unwrap();
+        assert_eq!(partial.have(), vec![0]);
+        let mut second = vec![3u8; big_small as usize];
+        second.extend(b"last");
+        assert!(deliver(&partial, 1, &second));
+        partial.finalize().unwrap();
+        assert_eq!(fs::read(dest.path().join("b")).unwrap(), vec![2u8; big_small as usize]);
+        assert_eq!(fs::read(dest.path().join("c")).unwrap(), vec![3u8; big_small as usize]);
+        assert_eq!(fs::read(dest.path().join("d")).unwrap(), b"last");
+        let modified = fs::metadata(dest.path().join("d")).unwrap().modified().unwrap();
+        assert_eq!(modified, UNIX_EPOCH + Duration::from_millis(1_600_000_000_000));
     }
 
     #[test]

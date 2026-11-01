@@ -132,6 +132,11 @@ fn check_component(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Small files travel packed together instead of each in units of their own.
+pub fn is_batched(size: u64) -> bool {
+    size > 0 && size < UNIT_SIZE / 2
+}
+
 /// Splits the files of a manifest into units.
 pub fn plan_units(files: &[FileEntry]) -> Vec<Unit> {
     let mut units = Vec::new();
@@ -141,7 +146,7 @@ pub fn plan_units(files: &[FileEntry]) -> Vec<Unit> {
         if file.size == 0 {
             continue;
         }
-        if file.size < UNIT_SIZE / 2 {
+        if is_batched(file.size) {
             if batch.len as u64 + file.size > UNIT_SIZE {
                 units.push(std::mem::take(&mut batch));
             }

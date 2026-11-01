@@ -32,9 +32,11 @@ const CLOSE_DONE: u32 = 0;
 const CLOSE_CANCELLED: u32 = 1;
 const CLOSE_NOT_FRIEND: u32 = 2;
 
-/// Each stream may buffer this much, and all of them together cap the memory a transfer can use.
-const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
-const SEND_WINDOW: u64 = 256 * 1024 * 1024;
+/// Must stay small. The QUIC library drops the connection if a stream holds more than 1024
+/// out-of-order fragments, and packet loss can leave one fragment per two packets in the window.
+/// At 2 MiB that can't happen, so speed comes from running many streams side by side.
+const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+const SEND_WINDOW: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
@@ -126,6 +128,7 @@ enum PairReply {
 
 struct Inner {
     endpoint: Endpoint,
+    network: Network,
     store: Mutex<Store>,
     events: mpsc::UnboundedSender<Event>,
     invites: Mutex<HashMap<String, Instant>>,
@@ -169,6 +172,7 @@ impl Node {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             endpoint: endpoint.clone(),
+            network,
             store: Mutex::new(store),
             events: events_tx,
             invites: Mutex::default(),
@@ -213,7 +217,7 @@ impl Node {
     /// Creates a single-use code. Anyone holding it can become a friend until it expires, so it
     /// should only travel over a private channel.
     pub async fn create_invite(&self) -> Result<String> {
-        let _ = tokio::time::timeout(ONLINE_TIMEOUT, self.inner.endpoint.online()).await;
+        self.inner.wait_online().await;
         let secret = hex::encode(rand::random::<[u8; 16]>());
         let expires = Instant::now() + INVITE_LIFETIME;
         let mut invites = self.inner.invites.lock().unwrap();
@@ -231,7 +235,7 @@ impl Node {
     /// ever reach the person who made it.
     pub async fn join(&self, code: &str) -> Result<FriendInfo> {
         let invite = decode_invite(code)?;
-        let _ = tokio::time::timeout(ONLINE_TIMEOUT, self.inner.endpoint.online()).await;
+        self.inner.wait_online().await;
         let conn = tokio::time::timeout(
             CONNECT_TIMEOUT,
             self.inner.endpoint.connect(invite.addr, PAIR_ALPN),
@@ -310,6 +314,13 @@ fn decode_invite(code: &str) -> Result<Invite> {
 }
 
 impl Inner {
+    /// Gives the relay connection a moment, so that invites contain a reachable address.
+    async fn wait_online(&self) {
+        if self.network == Network::Internet {
+            let _ = tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online()).await;
+        }
+    }
+
     fn new_transfer(&self) -> u64 {
         self.next_transfer.fetch_add(1, Ordering::Relaxed)
     }
@@ -324,6 +335,7 @@ impl Inner {
         match result {
             Ok(saved_to) => self.emit(Event::Finished { transfer, saved_to }),
             Err(error) => {
+                tracing::warn!(transfer, "transfer failed: {error:#}");
                 let lost = conn.is_some_and(|c| c.close_reason().is_some());
                 let error = if lost {
                     "The connection ended early. Send it again to continue where it stopped."
