@@ -107,6 +107,7 @@ async fn send(friend: &str, paths: Vec<PathBuf>) -> Result<()> {
     let (node, mut events) = start().await?;
     let friend = find_friend(&node, friend)?;
     node.send(&friend.id, paths)?;
+    let mut failure = None;
     while let Some(event) = events.recv().await {
         match event {
             Event::Progress { .. } => print_progress(&event),
@@ -114,12 +115,15 @@ async fn send(friend: &str, paths: Vec<PathBuf>) -> Result<()> {
                 println!("\nDelivered to {}.", friend.name);
                 break;
             }
-            Event::Failed { error, .. } => bail!("{error}"),
+            Event::Failed { error, .. } => {
+                failure = Some(error);
+                break;
+            }
             _ => {}
         }
     }
     node.shutdown().await;
-    Ok(())
+    failure.map_or(Ok(()), |error| bail!("{error}"))
 }
 
 async fn receive(dest: PathBuf) -> Result<()> {

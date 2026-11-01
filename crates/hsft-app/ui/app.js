@@ -245,12 +245,11 @@ listen("hsft", ({ payload: event }) => {
       break;
     }
     case "finished":
-      if (transfer(event.transfer).state === "offer") {
-        transfers.delete(event.transfer);
-      } else {
+      // A declined offer was already cleared when the button was pressed.
+      if (transfers.has(event.transfer)) {
         Object.assign(transfer(event.transfer), { state: "done", savedTo: event.savedTo });
+        render();
       }
-      render();
       break;
     case "failed":
       Object.assign(transfer(event.transfer), { state: "failed", error: event.error, speed: 0 });
