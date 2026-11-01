@@ -60,8 +60,16 @@ do. Over the internet, the slower connection's upload or download speed sets the
 | Through the public relay | About 0.35 MB/s |
 
 The relay figure only applies when no direct route can be found, such as when both friends are
-behind strict routers. The app shows "through a relay" when this happens. The public relay is too
-slow for large files, so a self-hosted relay is planned.
+behind strict routers. The app shows "Through a relay, slow" when this happens. The public relay is
+too slow for large files, so a self-hosted relay is planned.
+
+### Getting the best speed
+
+- Use Ethernet on both PCs if you can. Wi-Fi is often the real bottleneck.
+- Keep both PCs on the same plan's fastest connection, and pause other uploads such as cloud backups.
+- If a transfer shows "Through a relay, slow", connect both PCs with
+  [Tailscale](https://tailscale.com) (free for personal use) before creating the invite code. HSFT
+  picks up Tailscale addresses like any others, which can give you a direct route.
 
 Run your own measurement with `hsft-cli bench <path>`.
 

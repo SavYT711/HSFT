@@ -8,11 +8,25 @@
     <script src="app.js" defer></script>
   </head>
   <body>
+    <svg class="sprite" aria-hidden="true">
+      <symbol id="i-mark" viewBox="0 0 24 24"><path d="M2 8.5h11V3l9 9-9 9v-5.5H2z" /></symbol>
+      <symbol id="i-add" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v4h4" /></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v11H3z" /></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5" /></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15H4V4h11v1" /></symbol>
+    </svg>
+
     <header class="top">
-      <h1>HSFT</h1>
+      <h1><svg class="logo"><use href="#i-mark" /></svg>HSFT</h1>
       <nav>
-        <button id="open-add" class="primary">Add friend</button>
-        <button id="open-settings" class="quiet">Settings</button>
+        <button id="open-add" class="primary"><svg><use href="#i-add" /></svg>Add friend</button>
+        <button id="open-settings" class="quiet square" aria-label="Settings" title="Settings">
+          <svg><use href="#i-settings" /></svg>
+        </button>
       </nav>
     </header>
 
@@ -22,7 +36,7 @@
     <dialog id="add">
       <form method="dialog" class="sheet-head">
         <h2>Add friend</h2>
-        <button class="quiet">Close</button>
+        <button class="quiet square" aria-label="Close" title="Close"><svg><use href="#i-close" /></svg></button>
       </form>
 
       <section>
@@ -30,16 +44,16 @@
         <p>Create a code and send it to them privately. It works once, for 15 minutes.</p>
         <button id="make-invite" class="primary">Create invite code</button>
         <div id="invite-result" hidden>
-          <textarea id="invite-code" rows="5" readonly aria-label="Your invite code"></textarea>
-          <button id="copy-invite" class="quiet">Copy code</button>
-          <p>Keep HSFT open until they've pasted it.</p>
+          <textarea id="invite-code" rows="4" readonly aria-label="Your invite code"></textarea>
+          <button id="copy-invite" class="quiet"><svg><use href="#i-copy" /></svg><span>Copy code</span></button>
+          <p class="note">Keep HSFT open until they've pasted it.</p>
         </div>
       </section>
 
       <section>
         <h3>Got a code?</h3>
-        <label for="join-code">Paste the code your friend sent you</label>
-        <textarea id="join-code" rows="4" spellcheck="false"></textarea>
+        <label for="join-code">Paste the code your friend sent you.</label>
+        <textarea id="join-code" rows="3" spellcheck="false"></textarea>
         <button id="join" class="primary">Become friends</button>
       </section>
 
@@ -49,19 +63,19 @@
     <dialog id="settings">
       <form method="dialog" class="sheet-head">
         <h2>Settings</h2>
-        <button class="quiet">Close</button>
+        <button class="quiet square" aria-label="Close" title="Close"><svg><use href="#i-close" /></svg></button>
       </form>
 
       <section>
-        <label for="name">Your name, as friends see it</label>
+        <h3><label for="name">Your name</label></h3>
         <input id="name" maxlength="64" spellcheck="false" />
-        <p class="note">Friends you add from now on will see this name.</p>
+        <p class="note">New friends see this name when you connect.</p>
       </section>
 
       <section>
         <h3>Save received files in</h3>
         <p id="folder" class="path"></p>
-        <button id="change-folder" class="quiet">Change folder</button>
+        <button id="change-folder" class="quiet"><svg><use href="#i-folder" /></svg>Change folder</button>
       </section>
 
       <section>

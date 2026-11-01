@@ -153,6 +153,7 @@ impl Node {
         network: Network,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let store = Store::open(data_dir)?;
+        // Stays on the default Cubic congestion control: in testing, BBR hung a 3 GB transfer.
         let transport = QuicTransportConfig::builder()
             .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
             .send_window(SEND_WINDOW)

@@ -13,7 +13,7 @@ const settings = document.getElementById("settings");
 let friends = [];
 const transfers = new Map();
 
-function size(bytes) {
+function sizeParts(bytes) {
   const units = ["B", "KB", "MB", "GB", "TB"];
   let value = bytes;
   let unit = 0;
@@ -21,7 +21,18 @@ function size(bytes) {
     value /= 1024;
     unit += 1;
   }
-  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+  return [unit === 0 ? String(value) : value.toFixed(value < 100 ? 1 : 0), units[unit]];
+}
+
+function size(bytes) {
+  return sizeParts(bytes).join(" ");
+}
+
+function timeLeft(seconds) {
+  if (seconds < 60) return "under a minute left";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min left`;
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min left`;
 }
 
 function el(tag, className, text) {
@@ -31,8 +42,18 @@ function el(tag, className, text) {
   return node;
 }
 
-function button(label, style, action) {
-  const node = el("button", style, label);
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#i-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+function button(label, style, action, iconName) {
+  const node = el("button", style);
+  if (iconName) node.append(icon(iconName));
+  node.append(label);
   node.addEventListener("click", action);
   return node;
 }
@@ -43,34 +64,35 @@ function showError(id, message) {
   node.hidden = !message;
 }
 
-function friendName(id) {
-  return friends.find((friend) => friend.id === id)?.name ?? "A friend";
-}
-
 function transfer(id) {
   if (!transfers.has(id)) {
-    transfers.set(id, { id, state: "running", done: 0, bytes: 0, speed: 0, title: "Preparing" });
+    transfers.set(id, { id, state: "running", done: 0, bytes: 0, speed: 0, title: "your files" });
   }
   return transfers.get(id);
 }
 
-function detailText(t) {
+/** What a row says about a transfer, in both of its layers. */
+function describe(t) {
   switch (t.state) {
     case "offer":
-      return `Wants to send ${t.title}: ${size(t.bytes)}, ${t.files} ${t.files === 1 ? "file" : "files"}`;
+      return {
+        what: `Wants to send ${t.title}`,
+        detail: `${size(t.bytes)}, ${t.files} ${t.files === 1 ? "file" : "files"}`,
+      };
     case "done":
-      return t.direction === "receive" ? `Saved ${t.title}` : `Delivered ${t.title}`;
+      return { what: `${t.direction === "receive" ? "Saved" : "Delivered"} ${t.title}`, detail: "" };
     case "failed":
-      return t.error;
-    default: {
-      const route = { direct: "direct", relay: "through a relay" }[t.route];
-      const verb = t.direction === "receive" ? "Receiving" : "Sending";
-      const speed = t.speed ? `, ${size(t.speed)}/s` : "";
-      return t.route
-        ? `${verb} ${t.title}: ${size(t.done)} of ${size(t.bytes)}${speed}${route ? `, ${route}` : ""}`
-        : `Connecting to send ${t.title}`;
-    }
+      return { what: t.error, detail: "" };
   }
+  const verb = t.direction === "receive" ? "Receiving" : "Sending";
+  if (!t.route) return { what: `Connecting to send ${t.title}`, detail: "" };
+  const percent = t.bytes ? Math.floor((t.done / t.bytes) * 100) : 0;
+  const left = t.speed ? `, ${timeLeft((t.bytes - t.done) / t.speed)}` : "";
+  return {
+    what: `${verb} ${t.title}`,
+    detail: `${size(t.done)} of ${size(t.bytes)} (${percent}%)${left}`,
+    speed: t.speed ? sizeParts(t.speed) : null,
+  };
 }
 
 function progressPercent(t) {
@@ -87,18 +109,18 @@ function transferActions(t) {
   switch (t.state) {
     case "offer":
       return [
-        button("Accept", "primary", () => invoke("respond", { transfer: t.id, accept: true })),
+        button("Accept", "primary", () => invoke("respond", { transfer: t.id, accept: true }), "check"),
         button("Decline", "quiet", () => {
           invoke("respond", { transfer: t.id, accept: false });
           clear();
         }),
       ];
     case "running":
-      return [button("Stop", "quiet", () => invoke("cancel", { transfer: t.id }))];
+      return [button("Stop", "quiet", () => invoke("cancel", { transfer: t.id }), "stop")];
     default:
       return [
         ...(t.savedTo
-          ? [button("Show in folder", "quiet", () => invoke("reveal", { path: t.savedTo }))]
+          ? [button("Show in folder", "quiet", () => invoke("reveal", { path: t.savedTo }), "folder")]
           : []),
         button("Dismiss", "quiet", clear),
       ];
@@ -123,43 +145,65 @@ async function send(friendId, paths) {
   render();
 }
 
+function buildFace(className, name, initial, t) {
+  const face = el("div", className);
+  const text = el("div", "text");
+  text.append(el("div", "name", name));
+  if (t) text.append(el("div", "what"), el("div", "detail"));
+  else text.append(el("div", "drop-note", `Drop to send to ${name}`));
+  face.append(el("div", "avatar", initial), text);
+  if (t) face.append(el("div", "speed"));
+  return face;
+}
+
+function fillRow(row, t) {
+  const { what, detail, speed } = describe(t);
+  row.style.setProperty("--done", `${progressPercent(t)}%`);
+  for (const node of row.querySelectorAll(".what")) node.textContent = what;
+  for (const node of row.querySelectorAll(".detail")) node.textContent = detail;
+  for (const node of row.querySelectorAll(".speed")) {
+    node.replaceChildren();
+    if (speed) node.append(el("b", "", speed[0]), el("span", "", `${speed[1]}/s`));
+  }
+  const route = row.querySelector(".route");
+  const relayed = t.state === "running" && t.route === "relay";
+  route.textContent = t.state !== "running" || !t.route ? "" : relayed ? "Through a relay, slow" : "Direct";
+  route.classList.toggle("slow", relayed);
+  route.title = relayed ? "No direct route was found. Connecting both PCs with Tailscale can help." : "";
+}
+
 function buildRow(name, friendId, t, thin) {
   const row = el("div", "row");
+  const initial = [...friendName(friendId)][0]?.toUpperCase() ?? "?";
   row.classList.toggle("thin", thin);
-  if (friendId) row.dataset.friend = friendId;
-
-  const detail = t ? detailText(t) : "";
-  const fill = (layer) => {
-    layer.append(el("div", "name", name));
-    if (t) layer.append(el("div", "detail", detail));
-    return layer;
-  };
-  row.append(fill(el("div", "layer")));
+  row.dataset.friend = friendId;
+  row.append(buildFace("face", name, initial, t));
 
   if (t) {
     row.dataset.transfer = t.id;
-    row.classList.add("wrap");
     row.classList.toggle("failed", t.state === "failed");
-    row.style.setProperty("--done", `${progressPercent(t)}%`);
-    const flood = fill(el("div", "layer flood"));
+    const flood = buildFace("face flood", name, initial, t);
     flood.setAttribute("aria-hidden", "true");
-    row.append(flood);
-  } else {
-    row.classList.add("rest");
+    const foot = el("div", "foot");
+    foot.append(el("span", "route"), ...transferActions(t));
+    row.append(flood, foot);
+    fillRow(row, t);
+    return row;
   }
 
-  const actions = el("div", "actions");
-  if (t) {
-    actions.append(...transferActions(t));
-  } else {
-    const friend = friends.find((f) => f.id === friendId);
-    actions.append(
-      button("Send files", "quiet", pick(friend, false)),
-      button("Folder", "quiet", pick(friend, true)),
-    );
-  }
-  row.append(actions);
+  const friend = friends.find((f) => f.id === friendId);
+  const foot = el("div", "foot");
+  foot.append(
+    button("Files", "quiet", pick(friend, false), "file"),
+    button("Folder", "quiet", pick(friend, true), "folder"),
+  );
+  row.classList.add("rest");
+  row.append(foot);
   return row;
+}
+
+function friendName(id) {
+  return friends.find((friend) => friend.id === id)?.name ?? "";
 }
 
 function render() {
@@ -167,22 +211,21 @@ function render() {
   hint.hidden = friends.length === 0;
   if (friends.length === 0) {
     const empty = el("div", "empty");
+    const mark = icon("mark");
+    mark.classList.add("logo");
     empty.append(
+      mark,
       el("h2", "", "Add your first friend"),
       el("p", "", "Files go straight from your PC to theirs. Friends connect once with an invite code."),
-      button("Add friend", "primary", openAdd),
+      button("Add friend", "primary", openAdd, "add"),
     );
     list.append(empty);
     return;
   }
   for (const friend of friends) {
-    const theirs = [...transfers.values()].filter((t) => t.friendId === friend.id);
-    list.append(buildRow(friend.name, friend.id, null, false));
-    const [first, ...rest] = theirs;
-    if (first) {
-      list.lastChild.replaceWith(buildRow(friend.name, friend.id, first, false));
-      for (const t of rest) list.append(buildRow(t.title, friend.id, t, true));
-    }
+    const [first, ...rest] = [...transfers.values()].filter((t) => t.friendId === friend.id);
+    list.append(buildRow(friend.name, friend.id, first, false));
+    for (const t of rest) list.append(buildRow(t.title, friend.id, t, true));
   }
   const strays = [...transfers.values()].filter(
     (t) => t.friendId && !friends.some((friend) => friend.id === t.friendId),
@@ -193,10 +236,8 @@ function render() {
 /** Updates one row in place, so buttons keep working while progress ticks. */
 function updateRow(t) {
   const row = list.querySelector(`[data-transfer="${t.id}"]`);
-  if (!row) return render();
-  row.style.setProperty("--done", `${progressPercent(t)}%`);
-  const text = detailText(t);
-  for (const detail of row.querySelectorAll(".detail")) detail.textContent = text;
+  if (row) fillRow(row, t);
+  else render();
 }
 
 async function refresh() {
@@ -299,25 +340,34 @@ document.getElementById("open-add").addEventListener("click", openAdd);
 
 document.getElementById("make-invite").addEventListener("click", async (event) => {
   showError("add-error");
-  event.target.disabled = true;
+  event.currentTarget.disabled = true;
+  const makeInvite = event.currentTarget;
   try {
     document.getElementById("invite-code").value = await invoke("create_invite");
     document.getElementById("invite-result").hidden = false;
   } catch (error) {
     showError("add-error", String(error));
   }
-  event.target.disabled = false;
+  makeInvite.disabled = false;
 });
 
-document.getElementById("copy-invite").addEventListener("click", async (event) => {
-  await navigator.clipboard.writeText(document.getElementById("invite-code").value);
-  event.target.textContent = "Copied";
-  setTimeout(() => (event.target.textContent = "Copy code"), 1500);
+document.getElementById("copy-invite").addEventListener("click", async () => {
+  const label = document.querySelector("#copy-invite span");
+  const code = document.getElementById("invite-code");
+  try {
+    await navigator.clipboard.writeText(code.value);
+  } catch {
+    code.select();
+    document.execCommand("copy");
+  }
+  label.textContent = "Copied";
+  setTimeout(() => (label.textContent = "Copy code"), 1500);
 });
 
 document.getElementById("join").addEventListener("click", async (event) => {
   showError("add-error");
-  event.target.disabled = true;
+  const join = event.currentTarget;
+  join.disabled = true;
   try {
     await invoke("join_friend", { code: document.getElementById("join-code").value });
     await refresh();
@@ -325,7 +375,7 @@ document.getElementById("join").addEventListener("click", async (event) => {
   } catch (error) {
     showError("add-error", String(error));
   }
-  event.target.disabled = false;
+  join.disabled = false;
 });
 
 /* Settings */
