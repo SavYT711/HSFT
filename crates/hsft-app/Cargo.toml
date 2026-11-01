@@ -1,0 +1,21 @@
+[package]
+name = "hsft-app"
+description = "High-speed file transfer between friends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+dirs = "6"
+hsft-core = { path = "../hsft-core" }
+serde.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

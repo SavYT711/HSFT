@@ -70,7 +70,7 @@ pub enum Event {
     Started {
         transfer: u64,
         direction: Direction,
-        peer: String,
+        peer_id: String,
         title: String,
         bytes: u64,
     },
@@ -402,7 +402,7 @@ async fn run_send(
     inner.emit(Event::Started {
         transfer,
         direction: Direction::Send,
-        peer: friend.name.clone(),
+        peer_id: friend.id.clone(),
         title: scanned.manifest.title(),
         bytes: total,
     });
@@ -471,7 +471,7 @@ async fn run_receive(
     inner.emit(Event::Started {
         transfer,
         direction: Direction::Receive,
-        peer: friend.name.clone(),
+        peer_id: friend.id.clone(),
         title: manifest.title(),
         bytes: total,
     });

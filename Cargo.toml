@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hsft-core", "crates/hsft-cli"]
+members = ["crates/hsft-core", "crates/hsft-cli", "crates/hsft-app"]
 
 [workspace.package]
 version = "0.1.0"

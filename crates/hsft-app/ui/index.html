@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HSFT</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="top">
+      <h1>HSFT</h1>
+      <nav>
+        <button id="open-add" class="primary">Add friend</button>
+        <button id="open-settings" class="quiet">Settings</button>
+      </nav>
+    </header>
+
+    <main id="friends"></main>
+    <p id="hint" class="hint" hidden>Drop files or folders on a friend to send them.</p>
+
+    <dialog id="add">
+      <form method="dialog" class="sheet-head">
+        <h2>Add friend</h2>
+        <button class="quiet">Close</button>
+      </form>
+
+      <section>
+        <h3>Invite someone</h3>
+        <p>Create a code and send it to them privately. It works once, for 15 minutes.</p>
+        <button id="make-invite" class="primary">Create invite code</button>
+        <div id="invite-result" hidden>
+          <textarea id="invite-code" rows="5" readonly aria-label="Your invite code"></textarea>
+          <button id="copy-invite" class="quiet">Copy code</button>
+          <p>Keep HSFT open until they've pasted it.</p>
+        </div>
+      </section>
+
+      <section>
+        <h3>Got a code?</h3>
+        <label for="join-code">Paste the code your friend sent you</label>
+        <textarea id="join-code" rows="4" spellcheck="false"></textarea>
+        <button id="join" class="primary">Become friends</button>
+      </section>
+
+      <p id="add-error" class="error" role="alert" hidden></p>
+    </dialog>
+
+    <dialog id="settings">
+      <form method="dialog" class="sheet-head">
+        <h2>Settings</h2>
+        <button class="quiet">Close</button>
+      </form>
+
+      <section>
+        <label for="name">Your name, as friends see it</label>
+        <input id="name" maxlength="64" spellcheck="false" />
+        <p class="note">Friends you add from now on will see this name.</p>
+      </section>
+
+      <section>
+        <h3>Save received files in</h3>
+        <p id="folder" class="path"></p>
+        <button id="change-folder" class="quiet">Change folder</button>
+      </section>
+
+      <section>
+        <h3>Friends</h3>
+        <ul id="friend-admin"></ul>
+      </section>
+
+      <p id="settings-error" class="error" role="alert" hidden></p>
+    </dialog>
+  </body>
+</html>
