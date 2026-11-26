@@ -14,8 +14,46 @@ Usage:
   hsft-cli friends                list friends
   hsft-cli send <friend> <path>...  send files or folders to a friend
   hsft-cli receive <folder>       accept everything friends send, into a folder
-  hsft-cli bench <path>           measure speed by sending to a second peer on this PC
+  hsft-cli bench <path> [options] measure speed by sending to other peers on this PC
+
+Bench options:
+  --friends <n>          send to n friends at once, who pass pieces to each other
+  --limit <mbps>         cap every peer's upload, as on a slower home connection
+  --extra <adapter>      also send through this adapter's name or address
+  --extra-limit <mbps>   cap the extra connection's upload
 ";
+
+#[derive(Default)]
+struct BenchOptions {
+    friends: usize,
+    limit: Option<f64>,
+    extra: Option<String>,
+    extra_limit: Option<f64>,
+}
+
+fn parse_bench(args: &[&str]) -> Result<BenchOptions> {
+    let mut options = BenchOptions {
+        friends: 1,
+        ..Default::default()
+    };
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = args.next().with_context(|| format!("{flag} needs a value"))?;
+        match *flag {
+            "--friends" => options.friends = value.parse().context("--friends needs a number")?,
+            "--limit" => options.limit = Some(value.parse().context("--limit needs a number")?),
+            "--extra" => options.extra = Some(value.to_string()),
+            "--extra-limit" => {
+                options.extra_limit = Some(value.parse().context("--extra-limit needs a number")?)
+            }
+            other => bail!("unknown option {other}"),
+        }
+    }
+    if options.friends == 0 {
+        bail!("--friends must be at least 1");
+    }
+    Ok(options)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,7 +64,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
-        ["bench", path] => bench(Path::new(path)).await,
+        ["bench", path, options @ ..] => bench(Path::new(path), parse_bench(options)?).await,
         ["id"] => {
             let (node, _) = start().await?;
             println!("{}", node.id());
@@ -164,46 +202,95 @@ fn size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Sends through a real connection between two peers in this process. Disk and CPU are the limit
-/// here, so this measures what the software can do, not a real internet route.
-async fn bench(path: &Path) -> Result<()> {
+/// Sends through real connections between peers in this process. Without `--limit`, disk and CPU
+/// are the limit, so this measures what the software can do, not a real internet route.
+async fn bench(path: &Path, options: BenchOptions) -> Result<()> {
     let temp = std::env::temp_dir().join(format!("hsft-bench-{}", std::process::id()));
-    let (a_dir, b_dir, dest) = (temp.join("a"), temp.join("b"), temp.join("received"));
-    let (a, mut a_events) = Node::start(&a_dir, Network::LocalOnly).await?;
-    let (b, mut b_events) = Node::start(&b_dir, Network::LocalOnly).await?;
-    b.join(&a.create_invite().await?).await?;
+    let result = run_bench(path, &options, &temp).await;
+    let _ = std::fs::remove_dir_all(&temp);
+    result
+}
+
+async fn run_bench(path: &Path, options: &BenchOptions, temp: &Path) -> Result<()> {
+    let (sender, mut sender_events) = Node::start(&temp.join("sender"), Network::LocalOnly).await?;
+    sender.set_upload_limit(options.limit, options.extra_limit);
+    if let Some(extra) = &options.extra {
+        let mut settings = sender.settings();
+        settings.extra_adapter = Some(extra.clone());
+        sender.update_settings(settings)?;
+    }
+
+    let mut receivers = Vec::new();
+    for i in 0..options.friends {
+        let (node, events) = Node::start(&temp.join(format!("friend{i}")), Network::LocalOnly).await?;
+        node.set_upload_limit(options.limit, None);
+        node.join(&sender.create_invite().await?).await?;
+        receivers.push((node, events, temp.join(format!("received{i}"))));
+    }
+    let ids: Vec<String> = receivers.iter().map(|(node, _, _)| node.id()).collect();
 
     let started = Instant::now();
-    b.send(&a.id(), vec![path.to_path_buf()])?;
-    let mut bytes = 0;
-    let mut outcome = None;
-    while outcome.is_none() {
-        tokio::select! {
-            Some(event) = a_events.recv() => match event {
-                Event::Offer { transfer, bytes: total, .. } => {
-                    bytes = total;
-                    a.respond(transfer, Some(dest.clone()));
-                }
-                Event::Finished { .. } => outcome = Some(Ok(())),
-                Event::Failed { error, .. } => outcome = Some(Err(error)),
-                _ => {}
-            },
-            Some(event) = b_events.recv() => {
-                if let Event::Failed { error, .. } = event {
-                    outcome = Some(Err(error));
+    sender.send_group(&ids, vec![path.to_path_buf()])?;
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, (node, mut events, dest)) in receivers.into_iter().enumerate() {
+        tasks.spawn(async move {
+            let (mut bytes, mut from_peers) = (0, 0);
+            while let Some(event) = events.recv().await {
+                match event {
+                    Event::Offer { transfer, bytes: total, .. } => {
+                        bytes = total;
+                        node.respond(transfer, Some(dest.clone()));
+                    }
+                    Event::Progress { peer_bytes, .. } => from_peers = peer_bytes,
+                    Event::Finished { .. } => break,
+                    Event::Failed { error, .. } => bail!("friend {}: {error}", index + 1),
+                    _ => {}
                 }
             }
+            let seconds = started.elapsed().as_secs_f64();
+            node.shutdown().await;
+            Ok((index, bytes, seconds, from_peers))
+        });
+    }
+
+    let mut extra = 0;
+    let mut results = Vec::new();
+    while results.len() < options.friends {
+        tokio::select! {
+            Some(joined) = tasks.join_next() => results.push(joined??),
+            Some(event) = sender_events.recv() => match event {
+                Event::Progress { extra_bytes: Some(bytes), .. } => extra = extra.max(bytes),
+                Event::Failed { error, .. } => bail!("{error}"),
+                _ => {}
+            },
         }
     }
     let seconds = started.elapsed().as_secs_f64();
-    a.shutdown().await;
-    b.shutdown().await;
-    let _ = std::fs::remove_dir_all(&temp);
-    outcome.unwrap().map_err(anyhow::Error::msg)?;
-    println!(
-        "{} in {seconds:.2}s = {}/s",
-        size(bytes),
-        size((bytes as f64 / seconds) as u64)
-    );
+    sender.shutdown().await;
+    results.sort_by_key(|r| r.0);
+
+    let bytes = results.first().map_or(0, |r| r.1);
+    if options.friends == 1 {
+        println!("{} in {seconds:.2}s = {}/s", size(bytes), size((bytes as f64 / seconds) as u64));
+    } else {
+        println!("{} to {} friends in {seconds:.2}s", size(bytes), options.friends);
+        for (index, _, done_at, from_peers) in &results {
+            println!(
+                "  friend {}: done after {done_at:.2}s, {} from other friends",
+                index + 1,
+                size(*from_peers)
+            );
+        }
+    }
+    if options.extra.is_some() {
+        println!("  extra connection carried {}", size(extra));
+    }
+    if let Some(limit) = options.limit {
+        let one_copy = bytes as f64 * 8.0 / (limit * 1_000_000.0);
+        println!(
+            "  for comparison, one copy at {limit} Mbit/s takes {one_copy:.2}s, so sending to each friend in turn would take {:.2}s",
+            one_copy * options.friends as f64
+        );
+    }
     Ok(())
 }

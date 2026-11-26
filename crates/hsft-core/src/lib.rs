@@ -2,6 +2,7 @@
 
 pub mod codec;
 pub mod disk;
+pub mod net;
 pub mod node;
 pub mod plan;
 pub mod store;

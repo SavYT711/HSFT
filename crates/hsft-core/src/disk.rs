@@ -161,6 +161,10 @@ pub struct Partial {
     slots: Vec<Option<u64>>,
     batches: File,
     handles: Handles,
+    /// Kept apart from `handles`, which must stay writable.
+    read_handles: Handles,
+    /// True once files start moving to their real names, after which nothing may be read back.
+    finalized: std::sync::RwLock<bool>,
     journal: Mutex<File>,
     state: Mutex<PartialState>,
 }
@@ -225,6 +229,8 @@ impl Partial {
             slots,
             batches,
             handles: Handles::default(),
+            read_handles: Handles::default(),
+            finalized: std::sync::RwLock::new(false),
             journal: Mutex::new(journal),
             state: Mutex::new(PartialState { hashes, missing }),
         })
@@ -294,6 +300,23 @@ impl Partial {
         Ok(state.missing == 0)
     }
 
+    /// Reads back a unit this side holds, to pass it on to someone else.
+    pub fn read_unit(&self, index: u32) -> Result<(Vec<u8>, Hash)> {
+        let finalized = self.finalized.read().unwrap();
+        if *finalized {
+            bail!("the files have already been saved");
+        }
+        let hash = self.state.lock().unwrap().hashes[index as usize].context("unit not held")?;
+        let held = Held {
+            dir: &self.dir,
+            units: &self.units,
+            slots: &self.slots,
+            batches: &self.batches,
+            files: &self.manifest.files,
+        };
+        Ok((held.read(index, &self.read_handles)?, hash))
+    }
+
     pub fn root(&self) -> Result<Hash> {
         let state = self.state.lock().unwrap();
         if state.missing != 0 {
@@ -305,6 +328,9 @@ impl Partial {
     /// Moves everything to its real name, and returns where it landed. Existing files are never
     /// replaced: a clash gets a numbered name instead.
     pub fn finalize(&self) -> Result<PathBuf> {
+        // Waits for any read in progress, because Windows can't rename a file that is open.
+        *self.finalized.write().unwrap() = true;
+        self.read_handles.close_all();
         self.handles.close_all();
         let mut renamed: HashMap<&str, String> = HashMap::new();
         let top_names: Vec<(&str, bool)> = self
@@ -407,6 +433,8 @@ impl Partial {
 
     /// Removes the partial data.
     pub fn discard(&self) {
+        *self.finalized.write().unwrap() = true;
+        self.read_handles.close_all();
         self.handles.close_all();
         let _ = fs::remove_dir_all(&self.dir);
         if let Some(parent) = self.dir.parent() {

@@ -16,9 +16,12 @@ pub struct Friend {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub name: String,
     pub download_dir: Option<PathBuf>,
+    /// A second network adapter, such as Wi-Fi joined to a phone hotspot, to send over as well.
+    pub extra_adapter: Option<String>,
 }
 
 pub struct Store {

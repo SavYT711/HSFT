@@ -15,13 +15,53 @@ pub const HEADER_LEN: usize = 45;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum Control {
-    Offer { manifest: Manifest },
-    Accept { have: Vec<(u32, u32)> },
+    Offer {
+        manifest: Manifest,
+        #[serde(default)]
+        swarm: Option<SwarmInfo>,
+    },
+    /// `token` lets the sender attach extra connections to this transfer.
+    Accept {
+        have: Vec<(u32, u32)>,
+        #[serde(default)]
+        token: String,
+    },
     Decline { reason: String },
     Resend { unit: u32 },
+    /// Units that arrived from somewhere else, so they needn't be sent again.
+    Got { units: Vec<(u32, u32)> },
     Done { root: String },
     Verdict { ok: bool },
     Saved,
+}
+
+/// Everyone receiving the same files at once, who pass pieces to each other.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SwarmInfo {
+    pub id: String,
+    /// This receiver's place in `members`.
+    pub index: u32,
+    pub members: Vec<SwarmMember>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SwarmMember {
+    pub id: String,
+    pub name: String,
+    pub addr: Option<iroh::EndpointAddr>,
+}
+
+/// Opens an extra connection, proving it belongs to a transfer.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JoinRequest {
+    pub token: String,
+}
+
+/// Opens a connection between two members of a swarm.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SwarmHello {
+    pub swarm: String,
+    pub index: u32,
 }
 
 pub async fn write_msg<W, T>(writer: &mut W, msg: &T) -> Result<()>

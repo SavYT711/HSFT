@@ -18,6 +18,11 @@ struct Peer {
 }
 
 async fn peer(name: &str) -> Peer {
+    // Set HSFT_LOG to see what the peers are doing.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_env("HSFT_LOG"))
+        .with_test_writer()
+        .try_init();
     let data = tempfile::tempdir().unwrap();
     let (node, events) = Node::start(data.path(), Network::LocalOnly).await.unwrap();
     let mut settings = node.settings();
@@ -33,13 +38,37 @@ async fn peer(name: &str) -> Peer {
 async fn friends() -> (Peer, Peer) {
     let mut alice = peer("Alice").await;
     let bob = peer("Bob").await;
-    let invite = alice.node.create_invite().await.unwrap();
-    let friend = bob.node.join(&invite).await.unwrap();
-    assert_eq!(friend.name, "Alice");
-    assert_eq!(friend.id, alice.node.id());
-    next_matching(&mut alice, |e| matches!(e, Event::FriendAdded { .. })).await;
+    pair(&mut alice, &bob).await;
     assert_eq!(alice.node.friends()[0].name, "Bob");
     (alice, bob)
+}
+
+async fn pair(host: &mut Peer, guest: &Peer) {
+    let invite = host.node.create_invite().await.unwrap();
+    let friend = guest.node.join(&invite).await.unwrap();
+    assert_eq!(friend.id, host.node.id());
+    next_matching(host, |e| matches!(e, Event::FriendAdded { .. })).await;
+}
+
+/// Follows a transfer to its end, and returns how it ended plus the most bytes reported over
+/// the extra connection and from swarm members.
+async fn follow(peer: &mut Peer) -> (Event, u64, u64) {
+    let (mut extra, mut from_peers) = (0, 0);
+    let end = timeout(WAIT, async {
+        loop {
+            match peer.events.recv().await.expect("events ended") {
+                Event::Progress { extra_bytes, peer_bytes, .. } => {
+                    extra = extra.max(extra_bytes.unwrap_or(0));
+                    from_peers = from_peers.max(peer_bytes);
+                }
+                event if is_end(&event) => return event,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the transfer to end");
+    (end, extra, from_peers)
 }
 
 async fn next_matching(peer: &mut Peer, want: impl Fn(&Event) -> bool) -> Event {
@@ -223,6 +252,100 @@ async fn a_made_up_invite_is_rejected_cleanly() {
     let carol = peer("Carol").await;
     assert!(carol.node.join("hello").await.is_err());
     assert!(carol.node.join("hsft1-AAAA").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_extra_connection_carries_part_of_the_transfer() {
+    // Any real adapter works: here it only has to prove that both connections carry units.
+    let Some(adapter) = hsft_core::net::adapters().into_iter().next() else {
+        eprintln!("skipped: no network adapter");
+        return;
+    };
+    let (mut alice, mut bob) = friends().await;
+    let mut settings = bob.node.settings();
+    settings.extra_adapter = Some(adapter.ip);
+    bob.node.update_settings(settings).unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    let file = source.path().join("big.bin");
+    fs::write(&file, pseudo_random(200 * 1024 * 1024, "extra")).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let id = alice.node.id();
+    bob.node.send(&id, vec![file.clone()]).unwrap();
+    accept_offer(&mut alice, dest.path()).await;
+
+    let (sent, extra, _) = follow(&mut bob).await;
+    assert!(matches!(sent, Event::Finished { .. }), "{sent:?}");
+    assert!(matches!(next_matching(&mut alice, is_end).await, Event::Finished { .. }));
+    assert!(fs::read(dest.path().join("big.bin")).unwrap() == fs::read(&file).unwrap());
+    assert!(extra > 0, "nothing went over the extra connection");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn friends_in_a_group_pass_pieces_to_each_other() {
+    let mut alice = peer("Alice").await;
+    let mut bob = peer("Bob").await;
+    let mut carol = peer("Carol").await;
+    pair(&mut alice, &bob).await;
+    pair(&mut alice, &carol).await;
+
+    let source = tempfile::tempdir().unwrap();
+    let file = source.path().join("shared.bin");
+    fs::write(&file, pseudo_random(200 * 1024 * 1024, "swarm")).unwrap();
+    let (bob_dest, carol_dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ids = vec![bob.node.id(), carol.node.id()];
+    let transfers = alice.node.send_group(&ids, vec![file.clone()]).unwrap();
+    assert_eq!(transfers.len(), 2);
+
+    for (receiver, dest, other) in [(&mut bob, &bob_dest, "Carol"), (&mut carol, &carol_dest, "Bob")] {
+        let offer = next_matching(receiver, |e| matches!(e, Event::Offer { .. })).await;
+        let Event::Offer { transfer, shared_with, .. } = offer else { unreachable!() };
+        assert_eq!(shared_with, vec![other.to_string()]);
+        receiver.node.respond(transfer, Some(dest.path().to_path_buf()));
+    }
+    let ((bob_end, _, from_carol), (carol_end, _, from_bob)) =
+        tokio::join!(follow(&mut bob), follow(&mut carol));
+    assert!(matches!(bob_end, Event::Finished { .. }), "{bob_end:?}");
+    assert!(matches!(carol_end, Event::Finished { .. }), "{carol_end:?}");
+    for _ in 0..2 {
+        let sent = next_matching(&mut alice, is_end).await;
+        assert!(matches!(sent, Event::Finished { .. }), "{sent:?}");
+    }
+    let original = fs::read(&file).unwrap();
+    assert!(fs::read(bob_dest.path().join("shared.bin")).unwrap() == original);
+    assert!(fs::read(carol_dest.path().join("shared.bin")).unwrap() == original);
+    assert!(from_carol + from_bob > 0, "no pieces were passed between friends");
+    eprintln!("Bob got {from_carol} bytes from Carol, Carol got {from_bob} bytes from Bob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_member_saying_no_doesnt_hold_up_the_others() {
+    let mut alice = peer("Alice").await;
+    let mut bob = peer("Bob").await;
+    let mut carol = peer("Carol").await;
+    pair(&mut alice, &bob).await;
+    pair(&mut alice, &carol).await;
+
+    let source = tempfile::tempdir().unwrap();
+    let file = source.path().join("shared.bin");
+    fs::write(&file, pseudo_random(30 * 1024 * 1024, "decline")).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let ids = vec![bob.node.id(), carol.node.id()];
+    alice.node.send_group(&ids, vec![file.clone()]).unwrap();
+
+    accept_offer(&mut bob, dest.path()).await;
+    let offer = next_matching(&mut carol, |e| matches!(e, Event::Offer { .. })).await;
+    let Event::Offer { transfer, .. } = offer else { unreachable!() };
+    carol.node.respond(transfer, None);
+
+    let (bob_end, _, _) = follow(&mut bob).await;
+    assert!(matches!(bob_end, Event::Finished { .. }), "{bob_end:?}");
+    assert!(fs::read(dest.path().join("shared.bin")).unwrap() == fs::read(&file).unwrap());
+    let ends = [next_matching(&mut alice, is_end).await, next_matching(&mut alice, is_end).await];
+    assert!(ends.iter().any(|e| matches!(e, Event::Finished { .. })));
+    assert!(ends
+        .iter()
+        .any(|e| matches!(e, Event::Failed { error, .. } if error.contains("declined"))));
 }
 
 #[tokio::test(flavor = "multi_thread")]
