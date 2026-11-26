@@ -265,15 +265,16 @@ async fn run_bench(path: &Path, options: &BenchOptions, temp: &Path) -> Result<(
             },
         }
     }
-    let seconds = started.elapsed().as_secs_f64();
     sender.shutdown().await;
     results.sort_by_key(|r| r.0);
+    // When the last friend had everything, not counting the test peers shutting down.
+    let seconds = results.iter().map(|r| r.2).fold(0.0, f64::max);
 
     let bytes = results.first().map_or(0, |r| r.1);
     if options.friends == 1 {
         println!("{} in {seconds:.2}s = {}/s", size(bytes), size((bytes as f64 / seconds) as u64));
     } else {
-        println!("{} to {} friends in {seconds:.2}s", size(bytes), options.friends);
+        println!("{} to {} friends, all done in {seconds:.2}s", size(bytes), options.friends);
         for (index, _, done_at, from_peers) in &results {
             println!(
                 "  friend {}: done after {done_at:.2}s, {} from other friends",

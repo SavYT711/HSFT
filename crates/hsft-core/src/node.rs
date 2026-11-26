@@ -32,7 +32,8 @@ const INVITE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFER_TIMEOUT: Duration = Duration::from_secs(60);
-const SWARM_RETRY: Duration = Duration::from_secs(3);
+/// Short, because the first try often lands before the other friend has said yes.
+const SWARM_RETRY: Duration = Duration::from_secs(1);
 
 const CLOSE_DONE: u32 = 0;
 const CLOSE_CANCELLED: u32 = 1;
@@ -158,8 +159,10 @@ struct Inner {
     /// Incoming transfers shared with other friends, by swarm id.
     swarms: Mutex<HashMap<String, SwarmEntry>>,
     /// Upload caps for the main and extra connection, only ever set when measuring.
-    limits: Mutex<(Option<Arc<Limiter>>, Option<Arc<Limiter>>)>,
+    limits: Mutex<Limits>,
 }
+
+type Limits = (Option<Arc<Limiter>>, Option<Arc<Limiter>>);
 
 #[derive(Clone)]
 pub struct Node {
@@ -703,7 +706,7 @@ async fn dial_member(inner: Arc<Inner>, state: Arc<Receiving>, swarm: SwarmInfo,
                 index: swarm.index,
             };
             write_msg(&mut out, &hello).await?;
-            transfer::peer_session(conn, state.clone(), swarm.clone(), out, input).await
+            transfer::peer_session(conn, state.clone(), out, input).await
         };
         tokio::select! {
             _ = state.closed.cancelled() => return,
@@ -852,7 +855,7 @@ impl ProtocolHandler for SwarmProtocol {
             if !listed {
                 bail!("{remote} isn't a member of this swarm");
             }
-            transfer::peer_session(conn.clone(), state, swarm, out, input).await
+            transfer::peer_session(conn.clone(), state, out, input).await
         }
         .await;
         if let Err(error) = result {

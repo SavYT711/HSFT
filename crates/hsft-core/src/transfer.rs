@@ -42,7 +42,10 @@ pub const SWARM_ALPN: &[u8] = b"hsft/swarm/1";
 const STREAMS: usize = 16;
 /// Fewer, because each stream holds a whole unit and the extra connection is often the slower one.
 const EXTRA_STREAMS: usize = 4;
-const PEER_STREAMS: usize = 4;
+/// Fewer in a group too. A friend can only pass a unit on once all of it has arrived, so many
+/// units finishing together at the very end would leave a pile still to pass on.
+const GROUP_STREAMS: usize = 4;
+const PEER_STREAMS: usize = 8;
 const MAX_DAMAGED_UNITS: u32 = 32;
 /// Progress is counted in steps much smaller than a unit, so a slow link never looks frozen.
 const PROGRESS_STEP: usize = 64 * 1024;
@@ -50,6 +53,8 @@ const EXTRA_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// An extra connection that can't go direct would only borrow the main line through a relay.
 const EXTRA_DIRECT_WAIT: Duration = Duration::from_secs(10);
 const GOT_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a group receiver may go without new units before the sender sends them itself.
+const FALLBACK_AFTER: Duration = Duration::from_secs(3);
 const HAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
@@ -84,10 +89,13 @@ impl Limiter {
     }
 
     async fn take(&self, bytes: usize) {
+        // Credit for up to this long of unused time, as a real link has. Without it, every late
+        // timer wake-up on Windows (often 15 ms) would be lost, and few streams would run slow.
+        const BURST: Duration = Duration::from_millis(50);
         let wait = {
             let mut next = self.next.lock().unwrap();
             let now = std::time::Instant::now();
-            let start = (*next).max(now);
+            let start = (*next).max(now.checked_sub(BURST).unwrap_or(now));
             *next = start + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec);
             start.saturating_duration_since(now)
         };
@@ -119,6 +127,8 @@ pub struct Outgoing {
     pub manifest: Manifest,
     source: Source,
     hashes: Mutex<Vec<Option<Hash>>>,
+    /// Units already sent to some friend in a group, who passes them on to the others.
+    claimed: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Outgoing {
@@ -126,10 +136,12 @@ impl Outgoing {
         let Scanned { manifest, sources } = scanned;
         let source = Source::new(&manifest, sources);
         let hashes = Mutex::new(vec![None; source.units.len()]);
+        let claimed = Arc::new(Mutex::new(vec![false; source.units.len()]));
         Arc::new(Self {
             manifest,
             source,
             hashes,
+            claimed,
         })
     }
 
@@ -204,10 +216,19 @@ struct WorkQueue {
     state: Mutex<QueueState>,
     ready: Notify,
     lens: Vec<u32>,
+    /// In a group, which units some friend has already been sent.
+    claimed: Option<Arc<Mutex<Vec<bool>>>>,
 }
 
 struct QueueState {
     items: VecDeque<u32>,
+    /// Units another friend was sent, left for them to pass on unless that stalls.
+    deferred: VecDeque<u32>,
+    /// Units this receiver was the one sent, in a group.
+    mine: Vec<bool>,
+    /// When the receiver last got a unit, from anyone. Long silence means passing on stalled.
+    last_news: std::time::Instant,
+    fallback: bool,
     /// The receiver has these, so they are skipped.
     held: Vec<bool>,
     /// Already included in the progress count.
@@ -225,11 +246,21 @@ struct InFlight {
 }
 
 impl WorkQueue {
-    fn new(order: Vec<u32>, held: Vec<bool>, lens: Vec<u32>) -> Self {
+    fn new(
+        order: Vec<u32>,
+        held: Vec<bool>,
+        lens: Vec<u32>,
+        claimed: Option<Arc<Mutex<Vec<bool>>>>,
+    ) -> Self {
         let counted = held.clone();
+        let mine = vec![false; held.len()];
         Self {
             state: Mutex::new(QueueState {
                 items: order.into(),
+                deferred: VecDeque::new(),
+                mine,
+                last_news: std::time::Instant::now(),
+                fallback: false,
                 held,
                 counted,
                 in_flight: Vec::new(),
@@ -237,7 +268,36 @@ impl WorkQueue {
             }),
             ready: Notify::new(),
             lens,
+            claimed,
         }
+    }
+
+    /// Takes the next unit from `items` that nobody else in the group was sent.
+    fn take_fresh(&self, state: &mut QueueState) -> Option<u32> {
+        while let Some(unit) = state.items.pop_front() {
+            if state.held[unit as usize] {
+                continue;
+            }
+            if let Some(claimed) = &self.claimed {
+                let mut claimed = claimed.lock().unwrap();
+                if claimed[unit as usize] && !state.mine[unit as usize] {
+                    state.deferred.push_back(unit);
+                    continue;
+                }
+                claimed[unit as usize] = true;
+                state.mine[unit as usize] = true;
+            }
+            return Some(unit);
+        }
+        if state.fallback || state.last_news.elapsed() >= FALLBACK_AFTER {
+            state.fallback = true;
+            while let Some(unit) = state.deferred.pop_front() {
+                if !state.held[unit as usize] {
+                    return Some(unit);
+                }
+            }
+        }
+        None
     }
 
     /// Hands out the next unit to send. Once none are left, a stream that would sit idle sends a
@@ -248,20 +308,18 @@ impl WorkQueue {
             let ready = self.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
-            {
+            let waiting_on_friends = {
                 let mut state = self.state.lock().unwrap();
-                while let Some(unit) = state.items.pop_front() {
-                    if !state.held[unit as usize] {
-                        state.in_flight.push(InFlight {
-                            unit,
-                            extra,
-                            copied: false,
-                        });
-                        return Some(unit);
-                    }
-                }
                 if state.closed {
                     return None;
+                }
+                if let Some(unit) = self.take_fresh(&mut state) {
+                    state.in_flight.push(InFlight {
+                        unit,
+                        extra,
+                        copied: false,
+                    });
+                    return Some(unit);
                 }
                 let QueueState { held, in_flight, .. } = &mut *state;
                 if let Some(entry) = in_flight
@@ -271,8 +329,17 @@ impl WorkQueue {
                     entry.copied = true;
                     return Some(entry.unit);
                 }
+                !state.deferred.is_empty()
+            };
+            if waiting_on_friends {
+                // Look again once passing on may have stalled.
+                tokio::select! {
+                    _ = ready => {}
+                    _ = tokio::time::sleep(FALLBACK_AFTER / 3) => {}
+                }
+            } else {
+                ready.await;
             }
-            ready.await;
         }
     }
 
@@ -290,6 +357,7 @@ impl WorkQueue {
         let mut state = self.state.lock().unwrap();
         state.counted[unit as usize] = true;
         state.held[unit as usize] = true;
+        state.last_news = std::time::Instant::now();
         state.in_flight.retain(|e| e.unit != unit);
         drop(state);
         self.ready.notify_waiters();
@@ -300,6 +368,9 @@ impl WorkQueue {
         let mut state = self.state.lock().unwrap();
         let mut added = 0;
         for (unit, &got) in units.iter().enumerate() {
+            if got && !state.held[unit] {
+                state.last_news = std::time::Instant::now();
+            }
             if got {
                 state.held[unit] = true;
                 if !state.counted[unit] {
@@ -321,8 +392,8 @@ impl WorkQueue {
     }
 }
 
-/// The order units go out in. Swarm members get their own share first and the rest last, in
-/// reverse, so the sender's units and the ones passed between friends rarely overlap.
+/// The order units go out in. Swarm members get their own share first, then help with the shares
+/// of friends who are behind, taken from the end so they rarely meet the front of those shares.
 fn send_order(units: usize, swarm: Option<&SwarmInfo>) -> Vec<u32> {
     let units = units as u32;
     let Some(swarm) = swarm else {
@@ -362,10 +433,12 @@ pub async fn send(
     let already: u64 = (0..units.len()).filter(|&u| held[u]).map(|u| lens[u] as u64).sum();
     progress.done.fetch_add(already, Ordering::Relaxed);
     let order = send_order(units.len(), options.swarm.as_ref());
-    let queue = Arc::new(WorkQueue::new(order, held, lens));
+    let claimed = options.swarm.as_ref().map(|_| outgoing.claimed.clone());
+    let queue = Arc::new(WorkQueue::new(order, held, lens, claimed));
 
     let mut workers = JoinSet::new();
-    for _ in 0..STREAMS {
+    let streams = if options.swarm.is_some() { GROUP_STREAMS } else { STREAMS };
+    for _ in 0..streams {
         let (conn, outgoing, queue, progress) =
             (conn.clone(), outgoing.clone(), queue.clone(), progress.clone());
         let limit = options.limit.clone();
@@ -593,6 +666,9 @@ pub struct Receiving {
     got: mpsc::UnboundedSender<u32>,
     /// Caps the pieces passed on to other swarm members, when measuring.
     limit: Option<Arc<Limiter>>,
+    /// Units that came straight from the sender. Only these are passed on to other members: the
+    /// sender gives each unit to one member, so each unit then has exactly one member passing it on.
+    from_sender: Mutex<Vec<bool>>,
     /// Cancelled when the transfer ends, which stops extra and swarm connections.
     pub closed: CancellationToken,
 }
@@ -644,6 +720,13 @@ impl Incoming {
             resend: resend_tx,
             got: got_tx,
             limit,
+            from_sender: Mutex::new({
+                let mut held = vec![false; partial.units().len()];
+                for &unit in &have {
+                    held[unit as usize] = true;
+                }
+                held
+            }),
             closed: CancellationToken::new(),
         });
         let _closed = state.closed.clone().drop_guard();
@@ -781,6 +864,8 @@ async fn receive_stream(mut stream: RecvStream, state: Arc<Receiving>, origin: O
             Some(finished) => {
                 if origin == Origin::Peer {
                     let _ = state.got.send(header.unit);
+                } else {
+                    state.from_sender.lock().unwrap()[header.unit as usize] = true;
                 }
                 state.stored.notify_waiters();
                 if finished {
@@ -795,10 +880,10 @@ async fn receive_stream(mut stream: RecvStream, state: Arc<Receiving>, origin: O
 pub async fn peer_session(
     conn: Connection,
     state: Arc<Receiving>,
-    swarm: SwarmInfo,
     mut control_out: SendStream,
     control_in: RecvStream,
 ) -> Result<()> {
+    tracing::info!(held = state.partial.have().len(), "swarm member connected");
     let mut messages = read_messages(control_in);
     let units = state.partial.units().len();
     let peer_has = Arc::new(Mutex::new(vec![false; units]));
@@ -815,7 +900,6 @@ pub async fn peer_session(
         tasks.spawn(push_stream(
             conn.clone(),
             state.clone(),
-            swarm.clone(),
             peer_has.clone(),
             pushed.clone(),
             changed.clone(),
@@ -858,16 +942,14 @@ pub async fn peer_session(
     Ok(())
 }
 
-/// Passes on units the other member lacks, this member's own share first.
+/// Passes on the units this member got from the sender that the other member lacks.
 async fn push_stream(
     conn: Connection,
     state: Arc<Receiving>,
-    swarm: SwarmInfo,
     peer_has: Arc<Mutex<Vec<bool>>>,
     pushed: Arc<Mutex<Vec<bool>>>,
     changed: Arc<Notify>,
 ) -> Result<()> {
-    let members = swarm.members.len().max(1) as u32;
     let mut stream: Option<SendStream> = None;
     loop {
         let stored = state.stored.notified();
@@ -877,20 +959,14 @@ async fn push_stream(
         peer_changed.as_mut().enable();
 
         let next = {
-            let have = state.partial.have();
+            let ours = state.from_sender.lock().unwrap();
             let theirs = peer_has.lock().unwrap();
             let mut pushed = pushed.lock().unwrap();
-            let wanted = |unit: &&u32| !theirs[**unit as usize] && !pushed[**unit as usize];
-            let pick = have
-                .iter()
-                .filter(wanted)
-                .find(|unit| **unit % members == swarm.index)
-                .or_else(|| have.iter().find(wanted))
-                .copied();
+            let pick = (0..ours.len()).find(|&unit| ours[unit] && !theirs[unit] && !pushed[unit]);
             if let Some(unit) = pick {
-                pushed[unit as usize] = true;
+                pushed[unit] = true;
             }
-            pick
+            pick.map(|unit| unit as u32)
         };
 
         let Some(unit) = next else {
@@ -948,7 +1024,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_queue_skips_held_units_and_retries_first() {
-        let queue = WorkQueue::new(vec![0, 1, 2], vec![false, true, false], vec![10, 10, 10]);
+        let queue = WorkQueue::new(vec![0, 1, 2], vec![false, true, false], vec![10, 10, 10], None);
         assert_eq!(queue.pop(false).await, Some(0));
         assert_eq!(queue.got(&[false, false, true]), 10);
         queue.retry(0);
@@ -959,8 +1035,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_unit_another_friend_was_sent_waits_for_them_to_pass_it_on() {
+        let claimed = Arc::new(Mutex::new(vec![false, true]));
+        let queue = WorkQueue::new(vec![0, 1], vec![false, false], vec![10, 10], Some(claimed));
+        assert_eq!(queue.pop(false).await, Some(0));
+        queue.sent(0);
+        // Unit 1 went to another friend, so it is only sent here once news stops coming.
+        let early = tokio::time::timeout(FALLBACK_AFTER / 2, queue.pop(false)).await;
+        assert!(early.is_err(), "sent too soon");
+        let late = tokio::time::timeout(FALLBACK_AFTER * 2, queue.pop(false)).await;
+        assert_eq!(late.unwrap(), Some(1));
+    }
+
+    #[tokio::test]
     async fn the_main_connection_copies_what_the_extra_one_is_stuck_on() {
-        let queue = WorkQueue::new(vec![0], vec![false], vec![10]);
+        let queue = WorkQueue::new(vec![0], vec![false], vec![10], None);
         assert_eq!(queue.pop(true).await, Some(0));
         let idle = |extra| tokio::time::timeout(Duration::from_millis(50), queue.pop(extra));
         // Streams never copy units from their own connection.
