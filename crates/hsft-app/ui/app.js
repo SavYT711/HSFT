@@ -8,6 +8,7 @@ const { getCurrentWebview } = window.__TAURI__.webview;
 const list = document.getElementById("friends");
 const hint = document.getElementById("hint");
 const add = document.getElementById("add");
+const group = document.getElementById("group");
 const settings = document.getElementById("settings");
 
 let friends = [];
@@ -74,11 +75,15 @@ function transfer(id) {
 /** What a row says about a transfer, in both of its layers. */
 function describe(t) {
   switch (t.state) {
-    case "offer":
+    case "offer": {
+      const others = t.sharedWith?.length
+        ? `, also to ${t.sharedWith.join(", ")}, who you'll swap pieces with`
+        : "";
       return {
         what: `Wants to send ${t.title}`,
-        detail: `${size(t.bytes)}, ${t.files} ${t.files === 1 ? "file" : "files"}`,
+        detail: `${size(t.bytes)}, ${t.files} ${t.files === 1 ? "file" : "files"}${others}`,
       };
+    }
     case "done":
       return { what: `${t.direction === "receive" ? "Saved" : "Delivered"} ${t.title}`, detail: "" };
     case "failed":
@@ -88,9 +93,10 @@ function describe(t) {
   if (!t.route) return { what: `Connecting to send ${t.title}`, detail: "" };
   const percent = t.bytes ? Math.floor((t.done / t.bytes) * 100) : 0;
   const left = t.speed ? `, ${timeLeft((t.bytes - t.done) / t.speed)}` : "";
+  const peers = t.peerBytes ? `, ${size(t.peerBytes)} from other friends` : "";
   return {
     what: `${verb} ${t.title}`,
-    detail: `${size(t.done)} of ${size(t.bytes)} (${percent}%)${left}`,
+    detail: `${size(t.done)} of ${size(t.bytes)} (${percent}%)${left}${peers}`,
     speed: t.speed ? sizeParts(t.speed) : null,
   };
 }
@@ -130,17 +136,20 @@ function transferActions(t) {
 function pick(friend, directory) {
   return async () => {
     const chosen = await open({ multiple: !directory, directory });
-    if (chosen) send(friend.id, [chosen].flat());
+    if (chosen) send([friend.id], [chosen].flat());
   };
 }
 
-async function send(friendId, paths) {
+/** Sends to one friend, or to several who pass pieces to each other. */
+async function send(friendIds, paths) {
   try {
-    const id = await invoke("send_files", { friend: friendId, paths });
-    transfer(id).friendId = friendId;
+    const ids = await invoke("send_files", { friends: friendIds, paths });
+    ids.forEach((id, i) => (transfer(id).friendId = friendIds[i]));
   } catch (error) {
-    const id = `local-${Date.now()}`;
-    Object.assign(transfer(id), { friendId, state: "failed", error: String(error) });
+    for (const friendId of friendIds) {
+      const id = `local-${Date.now()}-${friendId}`;
+      Object.assign(transfer(id), { friendId, state: "failed", error: String(error) });
+    }
   }
   render();
 }
@@ -167,7 +176,9 @@ function fillRow(row, t) {
   }
   const route = row.querySelector(".route");
   const relayed = t.state === "running" && t.route === "relay";
-  route.textContent = t.state !== "running" || !t.route ? "" : relayed ? "Through a relay, slow" : "Direct";
+  const extra = t.extraBytes != null ? ` + extra connection (${size(t.extraBytes)})` : "";
+  route.textContent =
+    t.state !== "running" || !t.route ? "" : relayed ? "Through a relay, slow" : `Direct${extra}`;
   route.classList.toggle("slow", relayed);
   route.title = relayed ? "No direct route was found. Connecting both PCs with Tailscale can help." : "";
 }
@@ -245,8 +256,74 @@ async function refresh() {
   friends = state.friends;
   document.getElementById("name").value = state.name;
   document.getElementById("folder").textContent = state.downloadDir;
+  renderAdapters(state.adapters, state.extraAdapter);
   render();
 }
+
+function renderAdapters(adapters, chosen) {
+  const select = document.getElementById("extra");
+  const none = el("option", "", "None");
+  none.value = "";
+  const options = adapters.map((adapter) => {
+    const option = el("option", "", `${adapter.name} (${adapter.ip})`);
+    option.value = adapter.name;
+    return option;
+  });
+  // Keep a chosen adapter listed even while it's disconnected.
+  if (chosen && !adapters.some((adapter) => adapter.name === chosen)) {
+    const missing = el("option", "", `${chosen} (not connected)`);
+    missing.value = chosen;
+    options.push(missing);
+  }
+  select.replaceChildren(none, ...options);
+  select.value = chosen ?? "";
+}
+
+document.getElementById("extra").addEventListener("change", async (event) => {
+  try {
+    await invoke("set_extra_adapter", { adapter: event.target.value || null });
+    showError("settings-error");
+  } catch (error) {
+    showError("settings-error", String(error));
+  }
+});
+
+/* Sending to several friends */
+
+document.getElementById("open-group").addEventListener("click", () => {
+  showError("group-error");
+  const list = document.getElementById("group-friends");
+  list.replaceChildren();
+  if (friends.length < 2) list.append(el("li", "", "Add at least two friends first."));
+  for (const friend of friends) {
+    const label = el("label");
+    const box = el("input");
+    box.type = "checkbox";
+    box.value = friend.id;
+    label.append(box, el("span", "avatar", [...friend.name][0]?.toUpperCase() ?? "?"), friend.name);
+    const item = el("li");
+    item.append(label);
+    list.append(item);
+  }
+  group.showModal();
+});
+
+function groupPick(directory) {
+  return async () => {
+    const chosen = [...document.querySelectorAll("#group-friends input:checked")].map((b) => b.value);
+    if (chosen.length < 2) {
+      showError("group-error", "Choose at least two friends.");
+      return;
+    }
+    const paths = await open({ multiple: !directory, directory });
+    if (!paths) return;
+    group.close();
+    send(chosen, [paths].flat());
+  };
+}
+
+document.getElementById("group-files").addEventListener("click", groupPick(false));
+document.getElementById("group-folder").addEventListener("click", groupPick(true));
 
 listen("hsft", ({ payload: event }) => {
   switch (event.type) {
@@ -261,6 +338,7 @@ listen("hsft", ({ payload: event }) => {
         title: event.title,
         files: event.files,
         bytes: event.bytes,
+        sharedWith: event.sharedWith,
       });
       render();
       break;
@@ -281,6 +359,8 @@ listen("hsft", ({ payload: event }) => {
         bytes: event.total,
         speed: event.bytesPerSec,
         route: event.route,
+        extraBytes: event.extraBytes,
+        peerBytes: event.peerBytes,
       });
       updateRow(t);
       break;
@@ -321,7 +401,7 @@ getCurrentWebview().onDragDropEvent(({ payload }) => {
   } else if (payload.type === "drop") {
     const row = rowAt(payload.position);
     hover(null);
-    if (row && payload.paths.length) send(row.dataset.friend, payload.paths);
+    if (row && payload.paths.length) send([row.dataset.friend], payload.paths);
   } else {
     hover(null);
   }

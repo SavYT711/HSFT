@@ -15,6 +15,8 @@ pub fn adapters() -> Vec<Adapter> {
     let mut found: Vec<Adapter> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
+        // Hyper-V's virtual switches only lead to virtual machines on this PC.
+        .filter(|interface| !interface.name.starts_with("vEthernet"))
         .filter_map(|interface| match interface.ip() {
             std::net::IpAddr::V4(ip) if usable(ip) => Some(Adapter {
                 name: interface.name,

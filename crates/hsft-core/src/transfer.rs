@@ -55,6 +55,8 @@ const EXTRA_DIRECT_WAIT: Duration = Duration::from_secs(10);
 const GOT_INTERVAL: Duration = Duration::from_millis(500);
 /// How long a group receiver may go without new units before the sender sends them itself.
 const FALLBACK_AFTER: Duration = Duration::from_secs(3);
+/// How long a member that has everything keeps passing units on before saving its files.
+const PEER_GRACE: Duration = Duration::from_secs(15);
 const HAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
@@ -669,6 +671,8 @@ pub struct Receiving {
     /// Units that came straight from the sender. Only these are passed on to other members: the
     /// sender gives each unit to one member, so each unit then has exactly one member passing it on.
     from_sender: Mutex<Vec<bool>>,
+    /// Swarm members still connected that don't have everything yet.
+    peers_pending: AtomicUsize,
     /// Cancelled when the transfer ends, which stops extra and swarm connections.
     pub closed: CancellationToken,
 }
@@ -727,6 +731,7 @@ impl Incoming {
                 }
                 held
             }),
+            peers_pending: AtomicUsize::new(0),
             closed: CancellationToken::new(),
         });
         let _closed = state.closed.clone().drop_guard();
@@ -778,6 +783,14 @@ impl Incoming {
             }
             other => bail!("unexpected message: {other:?}"),
         }
+        // Other members may still be waiting on units only this one passes on, and nothing can
+        // be read back once the files move to their real names.
+        let grace = async {
+            while state.peers_pending.load(Ordering::Relaxed) > 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let _ = tokio::time::timeout(PEER_GRACE, grace).await;
         state.closed.cancel();
         let saved = spawn_blocking(move || partial.finalize()).await??;
         tracing::info!("files saved");
@@ -884,6 +897,14 @@ pub async fn peer_session(
     control_in: RecvStream,
 ) -> Result<()> {
     tracing::info!(held = state.partial.have().len(), "swarm member connected");
+    state.peers_pending.fetch_add(1, Ordering::Relaxed);
+    struct Pending(Arc<Receiving>);
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            self.0.peers_pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _pending = Pending(state.clone());
     let mut messages = read_messages(control_in);
     let units = state.partial.units().len();
     let peer_has = Arc::new(Mutex::new(vec![false; units]));

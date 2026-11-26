@@ -12,7 +12,9 @@ Usage:
   hsft-cli invite                 create an invite code and wait for a friend to use it
   hsft-cli join <code>            become friends using a friend's invite code
   hsft-cli friends                list friends
-  hsft-cli send <friend> <path>...  send files or folders to a friend
+  hsft-cli adapters               list network adapters, for --extra
+  hsft-cli send <friend> <path>...  send files or folders to a friend, or to several
+                                  friends at once, separated by commas
   hsft-cli receive <folder>       accept everything friends send, into a folder
   hsft-cli bench <path> [options] measure speed by sending to other peers on this PC
 
@@ -79,6 +81,12 @@ async fn main() -> Result<()> {
             node.shutdown().await;
             Ok(())
         }
+        ["adapters"] => {
+            for adapter in hsft_core::net::adapters() {
+                println!("{}  {}", adapter.ip, adapter.name);
+            }
+            Ok(())
+        }
         ["invite"] => invite().await,
         ["join", code] => {
             let (node, _) = start().await?;
@@ -141,27 +149,40 @@ fn find_friend(node: &Node, query: &str) -> Result<FriendInfo> {
     }
 }
 
-async fn send(friend: &str, paths: Vec<PathBuf>) -> Result<()> {
+/// `friends` is one name, or several separated by commas for a group send.
+async fn send(friends: &str, paths: Vec<PathBuf>) -> Result<()> {
     let (node, mut events) = start().await?;
-    let friend = find_friend(&node, friend)?;
-    node.send(&friend.id, paths)?;
-    let mut failure = None;
-    while let Some(event) = events.recv().await {
+    let friends = friends
+        .split(',')
+        .map(|name| find_friend(&node, name.trim()))
+        .collect::<Result<Vec<_>>>()?;
+    let ids: Vec<String> = friends.iter().map(|f| f.id.clone()).collect();
+    let transfers = node.send_group(&ids, paths)?;
+    let name = |transfer: u64| {
+        let index = transfers.iter().position(|t| *t == transfer).unwrap_or(0);
+        friends[index].name.clone()
+    };
+    let (mut ended, mut failures) = (0, Vec::new());
+    while ended < transfers.len() {
+        let Some(event) = events.recv().await else { break };
         match event {
-            Event::Progress { .. } => print_progress(&event),
-            Event::Finished { .. } => {
-                println!("\nDelivered to {}.", friend.name);
-                break;
+            Event::Progress { .. } if transfers.len() == 1 => print_progress(&event),
+            Event::Finished { transfer, .. } => {
+                ended += 1;
+                println!("\nDelivered to {}.", name(transfer));
             }
-            Event::Failed { error, .. } => {
-                failure = Some(error);
-                break;
+            Event::Failed { transfer, error } => {
+                ended += 1;
+                failures.push(format!("{}: {error}", name(transfer)));
             }
             _ => {}
         }
     }
     node.shutdown().await;
-    failure.map_or(Ok(()), |error| bail!("{error}"))
+    match failures.is_empty() {
+        true => Ok(()),
+        false => bail!("{}", failures.join("\n")),
+    }
 }
 
 async fn receive(dest: PathBuf) -> Result<()> {

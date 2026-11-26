@@ -425,7 +425,8 @@ label {
 }
 
 textarea,
-input {
+input,
+select {
   display: block;
   width: 100%;
   margin-bottom: 10px;
@@ -440,9 +441,49 @@ input {
 }
 
 textarea:focus,
-input:focus {
+input:focus,
+select:focus {
   border-color: var(--signal);
   outline: 0;
+}
+
+.checks {
+  margin: 4px 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.checks label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  border-radius: 10px;
+  padding: 8px 6px;
+  cursor: pointer;
+}
+
+.checks label:hover {
+  background: var(--panel-high);
+}
+
+.checks input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--signal);
+}
+
+.checks .avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  font-size: 15px;
+}
+
+.row-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 #invite-result {

@@ -20,6 +20,8 @@ struct Overview {
     name: String,
     download_dir: String,
     friends: Vec<FriendInfo>,
+    extra_adapter: Option<String>,
+    adapters: Vec<hsft_core::net::Adapter>,
 }
 
 fn download_dir(node: &Node) -> PathBuf {
@@ -35,10 +37,13 @@ fn message(error: anyhow::Error) -> String {
 
 #[tauri::command]
 fn overview(app: State<App>) -> Overview {
+    let settings = app.node.settings();
     Overview {
-        name: app.node.settings().name,
+        name: settings.name,
         download_dir: download_dir(&app.node).display().to_string(),
         friends: app.node.friends(),
+        extra_adapter: settings.extra_adapter,
+        adapters: hsft_core::net::adapters(),
     }
 }
 
@@ -57,13 +62,22 @@ fn remove_friend(app: State<App>, id: String) -> Result<(), String> {
     app.node.remove_friend(&id).map_err(message)
 }
 
+/// Sends to one friend, or to several who then pass pieces to each other. Returns a transfer
+/// number per friend, in the same order.
 #[tauri::command]
 async fn send_files(
     app: State<'_, App>,
-    friend: String,
+    friends: Vec<String>,
     paths: Vec<PathBuf>,
-) -> Result<u64, String> {
-    app.node.send(&friend, paths).map_err(message)
+) -> Result<Vec<u64>, String> {
+    app.node.send_group(&friends, paths).map_err(message)
+}
+
+#[tauri::command]
+fn set_extra_adapter(app: State<App>, adapter: Option<String>) -> Result<(), String> {
+    let mut settings = app.node.settings();
+    settings.extra_adapter = adapter.filter(|a| !a.is_empty());
+    app.node.update_settings(settings).map_err(message)
 }
 
 #[tauri::command]
@@ -158,6 +172,7 @@ fn main() {
             cancel,
             set_name,
             set_download_dir,
+            set_extra_adapter,
             reveal,
         ])
         .on_window_event(|window, event| {
